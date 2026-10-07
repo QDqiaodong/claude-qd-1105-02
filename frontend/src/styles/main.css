@@ -1,0 +1,29 @@
+:root {
+  /* 靛蓝主色 —— 与赭石系各仓主色明显区分 */
+  --primary: #3F51B5;
+  --primary-deep: #32449A;
+  --primary-soft: #878FCF;
+  --primary-wash: #E3E3F1;
+  --ink: #2b2f42;
+  --muted: #7a8099;
+  --line: #dfe2f0;
+  --bg: #f3f4fa;
+
+  --el-color-primary: #3F51B5;
+  --el-color-primary-light-3: #6A74C4;
+  --el-color-primary-light-5: #878FCF;
+  --el-color-primary-light-7: #AEAEDD;
+  --el-color-primary-light-8: #C3C3E6;
+  --el-color-primary-light-9: #E3E3F1;
+  --el-color-primary-dark-2: #32449A;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "PingFang SC", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+}
