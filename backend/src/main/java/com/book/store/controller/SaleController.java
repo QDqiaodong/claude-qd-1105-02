@@ -52,6 +52,12 @@ public class SaleController {
 
     @PostMapping("/{id}/refund")
     public ApiResponse<Sale> refund(@PathVariable Long id) {
-        return ApiResponse.success(saleService.refund(id));
+        Sale sale = saleService.refund(id);
+        // 部分明细的图书档案缺失时，退款仍整单完成，service 把逐本提示放在 refundNote 带回页面；
+        // 重复退款 / 状态不合法由 service 抛业务异常（400），不会走到这里
+        if (sale.refundNote != null && !sale.refundNote.isBlank()) {
+            return ApiResponse.success(sale.refundNote, sale);
+        }
+        return ApiResponse.success("退款成功，库存已一次性恢复", sale);
     }
 }

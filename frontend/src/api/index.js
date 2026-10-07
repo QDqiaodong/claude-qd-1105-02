@@ -19,6 +19,16 @@ async function call(promise) {
   return body.data
 }
 
+// 与 call 相同，但把后端成功响应里的 message 一并带回（退款提示、幂等重复操作提示等）
+async function callWithMessage(promise) {
+  const response = await promise
+  const body = response.data
+  if (!body || body.ok === false) {
+    throw new Error((body && body.message) || '请求失败')
+  }
+  return { data: body.data, message: body.message }
+}
+
 const params = (o) => ({ params: o })
 
 export default {
@@ -67,5 +77,5 @@ export default {
   createSale: (d) => call(http.post('/sales', d)),
   updateSale: (id, d) => call(http.put(`/sales/${id}`, d)),
   checkoutSale: (id) => call(http.post(`/sales/${id}/checkout`)),
-  refundSale: (id) => call(http.post(`/sales/${id}/refund`))
+  refundSale: (id) => callWithMessage(http.post(`/sales/${id}/refund`))
 }

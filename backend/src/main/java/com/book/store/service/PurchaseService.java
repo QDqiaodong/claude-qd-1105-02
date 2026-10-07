@@ -1,6 +1,9 @@
 package com.book.store.service;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -15,28 +18,36 @@ import com.book.store.common.Dict;
 import com.book.store.entity.Book;
 import com.book.store.entity.Purchase;
 import com.book.store.entity.PurchaseItem;
+import com.book.store.entity.StockLog;
 import com.book.store.entity.Supplier;
 import com.book.store.repository.BookRepository;
 import com.book.store.repository.PurchaseItemRepository;
 import com.book.store.repository.PurchaseRepository;
+import com.book.store.repository.StockLogRepository;
 import com.book.store.repository.SupplierRepository;
 
 @Service
 public class PurchaseService {
 
+    private static final String LOG_STOCK_IN = "进货入库";
+    private static final String LOG_VOID = "进货作废";
+
     private final PurchaseRepository purchaseRepository;
     private final PurchaseItemRepository purchaseItemRepository;
     private final BookRepository bookRepository;
     private final SupplierRepository supplierRepository;
+    private final StockLogRepository stockLogRepository;
 
     public PurchaseService(PurchaseRepository purchaseRepository,
                            PurchaseItemRepository purchaseItemRepository,
                            BookRepository bookRepository,
-                           SupplierRepository supplierRepository) {
+                           SupplierRepository supplierRepository,
+                           StockLogRepository stockLogRepository) {
         this.purchaseRepository = purchaseRepository;
         this.purchaseItemRepository = purchaseItemRepository;
         this.bookRepository = bookRepository;
         this.supplierRepository = supplierRepository;
+        this.stockLogRepository = stockLogRepository;
     }
 
     // ---------------- DTO ----------------
@@ -244,19 +255,21 @@ public class PurchaseService {
                     + "，本入库单被整单拒绝，库存未做任何变更；重新启用该供应商后可再次入库");
         }
 
-        List<PurchaseItem> items = purchaseItemRepository.findByPurchaseId(id);
+        List<PurchaseItem> items = sortedItems(id);
         if (items.isEmpty()) {
             throw new BizException("进货单无明细，无法入库");
         }
         for (PurchaseItem it : items) {
             Book book = bookRepository.findByIdForUpdate(it.bookId)
                     .orElseThrow(() -> new BizException("明细图书已不存在"));
-            book.stock += it.qty;
+            int after = book.stock + it.qty;
+            book.stock = after;
             // 入库后若有库存且原缺货，恢复在售
-            if (book.stock > 0 && "缺货".equals(book.status)) {
+            if (after > 0 && "缺货".equals(book.status)) {
                 book.status = "在售";
             }
             bookRepository.save(book);
+            writeStockLog(book.id, it.qty, after, LOG_STOCK_IN, id);
         }
         purchase.status = "已入库";
         Purchase saved = purchaseRepository.save(purchase);
@@ -276,14 +289,20 @@ public class PurchaseService {
         }
         // 已入库的作废需回滚库存
         if ("已入库".equals(purchase.status)) {
-            for (PurchaseItem it : purchaseItemRepository.findByPurchaseId(id)) {
+            for (PurchaseItem it : sortedItems(id)) {
                 Book book = bookRepository.findByIdForUpdate(it.bookId).orElse(null);
                 if (book != null) {
-                    book.stock = Math.max(0, book.stock - it.qty);
+                    int before = book.stock;
+                    // 库存被后续销售占用、不足回滚时不允许扣成负数：按实际可回滚量回退
+                    int rolled = Math.min(before, it.qty);
+                    book.stock = before - rolled;
                     if (book.stock == 0 && "在售".equals(book.status)) {
                         book.status = "缺货";
                     }
                     bookRepository.save(book);
+                    if (rolled > 0) {
+                        writeStockLog(book.id, -rolled, book.stock, LOG_VOID, id);
+                    }
                 }
             }
         }
@@ -295,5 +314,23 @@ public class PurchaseService {
 
     private static String reasonText(String reason) {
         return (reason != null && !reason.isBlank()) ? "（原因：" + reason.trim() + "）" : "";
+    }
+
+    /** 取明细并按图书 id 升序：与销售结账 / 退款按相同顺序锁图书行，避免跨单据事务死锁。 */
+    private List<PurchaseItem> sortedItems(Long purchaseId) {
+        List<PurchaseItem> items = new ArrayList<>(purchaseItemRepository.findByPurchaseId(purchaseId));
+        items.sort(Comparator.comparing(it -> it.bookId == null ? Long.MAX_VALUE : it.bookId));
+        return items;
+    }
+
+    private void writeStockLog(Long bookId, int changeQty, int stockAfter, String bizType, Long bizId) {
+        StockLog logRow = new StockLog();
+        logRow.bookId = bookId;
+        logRow.changeQty = changeQty;
+        logRow.stockAfter = stockAfter;
+        logRow.bizType = bizType;
+        logRow.bizId = bizId;
+        logRow.createdAt = LocalDateTime.now();
+        stockLogRepository.save(logRow);
     }
 }

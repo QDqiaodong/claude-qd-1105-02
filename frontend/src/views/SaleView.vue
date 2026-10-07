@@ -11,6 +11,9 @@ const selectedId = ref(null)
 const detail = ref(null)
 const loading = ref(false)
 
+// 结账 / 退款进行中标志：重复点击、刷新重试期间按钮保持禁用，请求只可能发出一次
+const actioning = ref(false)
+
 const books = ref([])
 const dialogVisible = ref(false)
 const saving = ref(false)
@@ -70,10 +73,18 @@ function fmtPrice(p) {
   return p != null ? `¥${Number(p).toFixed(2)}` : '—'
 }
 
+function fmtTime(t) {
+  return t ? String(t).replace('T', ' ').slice(0, 16) : '—'
+}
+
+// 单价取结账快照（bookPrice），档案缺失 / 改动后仍按成交单价展示
+function rowPrice(row) {
+  return row.bookPrice != null ? Number(row.bookPrice) : null
+}
+
 function fmtSubtotal(row) {
-  return row.book && row.book.price != null
-    ? `¥${(Number(row.book.price) * (row.qty || 0)).toFixed(2)}`
-    : '—'
+  const price = rowPrice(row)
+  return price != null ? `¥${(price * (row.qty || 0)).toFixed(2)}` : '—'
 }
 
 async function openNew() {
@@ -107,24 +118,43 @@ async function submitNew() {
 }
 
 async function checkout() {
+  if (actioning.value) return
+  actioning.value = true
   try {
     await api.checkoutSale(selectedId.value)
     ElMessage.success('已结账，库存已扣减')
     await load()
     emit('changed')
   } catch (e) {
+    // 并发冲突 / 库存被其他销售单占用时后端整单拒绝、无半更新；
+    // 立即按最新状态刷新，列表与按钮与后端对齐后用户可安全重试
     ElMessage.error(e.message)
+    await load()
+  } finally {
+    actioning.value = false
   }
 }
 
 async function refund() {
+  if (actioning.value) return
+  actioning.value = true
   try {
-    await api.refundSale(selectedId.value)
-    ElMessage.success('已退款，库存已回滚')
+    const { message } = await api.refundSale(selectedId.value)
     await load()
+    if (message && message.includes('档案已缺失')) {
+      // 含「档案缺失」明细的退款：库存按可回滚部分整单完成，用警告色突出提示
+      ElMessage.warning(message, { duration: 8000 })
+    } else {
+      ElMessage.success(message || '已退款，库存已回滚')
+    }
     emit('changed')
   } catch (e) {
+    // 并发退款的后到者、锁冲突等：后端要么已由另一操作整单完成、要么整单未动；
+    // 这里必须重新拉取列表与详情，避免页面停留在「已结账可退款」的过期状态
     ElMessage.error(e.message)
+    await load()
+  } finally {
+    actioning.value = false
   }
 }
 
@@ -153,6 +183,9 @@ onMounted(load)
             <el-tag :type="STATUS_TAG[s.status]" size="small">{{ s.status }}</el-tag>
           </div>
           <div class="row-sub">总额 ¥{{ (s.total || 0).toFixed(2) }}</div>
+          <div v-if="s.status === '已退款'" class="row-refunded">
+            退款时间 {{ fmtTime(s.refundedAt) }}
+          </div>
         </div>
         <el-empty v-if="!sales.length" description="暂无销售单" :image-size="60" />
       </div>
@@ -164,41 +197,69 @@ onMounted(load)
             <span>销售单 #{{ detail.sale.id }}</span>
             <el-tag :type="STATUS_TAG[detail.sale.status]" size="small">{{ detail.sale.status }}</el-tag>
             <span class="muted">总额 ¥{{ (detail.sale.total || 0).toFixed(2) }}</span>
+            <span v-if="detail.sale.status === '已退款'" class="muted">
+              退款时间：{{ fmtTime(detail.sale.refundedAt) }}
+            </span>
           </div>
+
+          <!-- 明细图书档案缺失：保留结账快照并给出明确提示，不影响退款整单完成 -->
+          <el-alert
+            v-if="detail.hasMissingBook"
+            class="missing-alert"
+            type="warning"
+            show-icon
+            :closable="false"
+            :title="detail.sale.refundNote || '该单含图书档案缺失的明细，已按结账时快照保留原内容'"
+          />
+
           <el-table :data="detail.items" border size="small" style="margin-top:10px">
             <el-table-column label="图书" min-width="200">
               <template #default="{ row }">
-                <template v-if="row.book">
+                <template v-if="!row.bookMissing">
                   <div>{{ row.book.title }}</div>
                   <div class="book-sub">ISBN {{ row.book.isbn || '未登记' }}</div>
                 </template>
-                <span v-else class="book-sub">图书档案缺失（#{{ row.bookId }}）</span>
+                <template v-else>
+                  <div>
+                    {{ row.bookTitle || '未命名图书' }}
+                    <el-tag type="warning" size="small" effect="plain">档案缺失·快照</el-tag>
+                  </div>
+                  <div class="book-sub">ISBN {{ row.bookIsbn || '未登记' }}（原档案 #{{ row.bookId }} 已不存在）</div>
+                </template>
               </template>
             </el-table-column>
             <el-table-column prop="qty" label="数量" width="80" />
             <el-table-column label="单价" width="100">
-              <template #default="{ row }">{{ row.book ? fmtPrice(row.book.price) : '—' }}</template>
+              <template #default="{ row }">{{ fmtPrice(row.bookPrice) }}</template>
             </el-table-column>
             <el-table-column label="小计" width="110">
               <template #default="{ row }">{{ fmtSubtotal(row) }}</template>
             </el-table-column>
             <el-table-column label="操作" width="100">
               <template #default="{ row }">
-                <el-button type="primary" link size="small" :disabled="!row.book" @click="goBook(row)">查看图书</el-button>
+                <el-button type="primary" link size="small" :disabled="!!row.bookMissing" @click="goBook(row)">查看图书</el-button>
               </template>
             </el-table-column>
           </el-table>
           <div class="actions">
             <el-button
               type="success"
-              :disabled="detail.sale.status !== '草稿'"
+              :loading="actioning"
+              :disabled="detail.sale.status !== '草稿' || actioning"
               @click="checkout"
             >结账</el-button>
             <el-button
               type="warning"
-              :disabled="detail.sale.status !== '已结账'"
+              :loading="actioning"
+              :disabled="detail.sale.status !== '已结账' || actioning"
               @click="refund"
             >退款</el-button>
+            <span v-if="detail.sale.status === '已退款'" class="hint">
+              已退款（{{ fmtTime(detail.sale.refundedAt) }}），库存已恢复，不可重复退款
+            </span>
+            <span v-else-if="detail.sale.status === '草稿'" class="hint">
+              草稿未结账，暂不能退款
+            </span>
           </div>
         </template>
         <el-empty v-else description="请选择左侧销售单" />
@@ -237,11 +298,14 @@ onMounted(load)
 .row-top { display: flex; justify-content: space-between; align-items: center; }
 .pid { font-weight: 600; }
 .row-sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.row-refunded { color: var(--el-color-warning); font-size: 12px; margin-top: 4px; }
 .detail { flex: 1; min-width: 0; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
 .detail-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-weight: 600; }
 .muted { color: var(--muted); font-weight: 400; font-size: 13px; }
 .book-sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
-.actions { margin-top: 14px; display: flex; gap: 10px; }
+.missing-alert { margin-top: 10px; }
+.actions { margin-top: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.hint { color: var(--muted); font-size: 12px; }
 .items { display: flex; flex-direction: column; gap: 8px; }
 .item-row { display: flex; gap: 8px; align-items: center; }
 </style>
