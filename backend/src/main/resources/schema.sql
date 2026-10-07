@@ -15,6 +15,7 @@ CREATE DATABASE IF NOT EXISTS book_store
 USE book_store;
 
 SET FOREIGN_KEY_CHECKS = 0;
+DROP TABLE IF EXISTS stock_ledger;
 DROP TABLE IF EXISTS sale_item;
 DROP TABLE IF EXISTS purchase_item;
 DROP TABLE IF EXISTS sale;
@@ -35,7 +36,9 @@ CREATE TABLE book (
     price      DECIMAL(10,2) NOT NULL COMMENT '定价',
     stock      INT          NOT NULL COMMENT '库存',
     status     VARCHAR(16)  COMMENT '在售 / 缺货 / 下架',
-    created_at DATETIME     COMMENT '创建时间'
+    created_at DATETIME     COMMENT '创建时间',
+    -- 数据库层兜底：任何业务 bug / 并发丢失更新都不允许把库存写成负数
+    CONSTRAINT chk_book_stock_nonneg CHECK (stock >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 供应商 ----------------
@@ -81,18 +84,42 @@ CREATE TABLE purchase_item (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 销售单 ----------------
+-- refunded_at 退款时间：退款事务内与状态置「已退款」、库存回滚、退款流水一次性写入，可追溯
 CREATE TABLE sale (
-    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-    total      DECIMAL(12,2) COMMENT '销售总额（自动汇总）',
-    status     VARCHAR(16)  COMMENT '草稿 / 已结账 / 已退款',
-    created_at DATETIME     COMMENT '创建时间'
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    total       DECIMAL(12,2) COMMENT '销售总额（结账时按快照价汇总）',
+    status      VARCHAR(16)  COMMENT '草稿 / 已结账 / 已退款',
+    refunded_at DATETIME     COMMENT '退款时间（未退款为空）',
+    created_at  DATETIME     COMMENT '创建时间'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- book_title/book_isbn/book_price：结账时固化的原书快照。
+-- 销售单结账后即为历史凭证，之后图书改名改价甚至档案删除，本单展示与退款核对都以快照为准。
 CREATE TABLE sale_item (
-    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
-    sale_id    BIGINT NOT NULL COMMENT '销售单 id',
-    book_id    BIGINT NOT NULL COMMENT '图书 id',
-    qty        INT NOT NULL COMMENT '销售数量'
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sale_id     BIGINT NOT NULL COMMENT '销售单 id',
+    book_id     BIGINT NOT NULL COMMENT '图书 id',
+    qty         INT NOT NULL COMMENT '销售数量',
+    book_title  VARCHAR(128) COMMENT '结账时书名快照',
+    book_isbn   VARCHAR(32)  COMMENT '结账时 ISBN 快照',
+    book_price  DECIMAL(10,2) COMMENT '结账时单价快照'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------- 库存流水 ----------------
+-- 每次销售结账/退款、进货入库/作废都在业务事务内追加一条，只增不改。
+-- 唯一键 (biz_type,biz_id,book_id)：同一单据对同一本书的同类动作最多一条，
+-- 重复点击 / 刷新重试 / 两人同时退款都不可能产生第二条回滚流水。
+CREATE TABLE stock_ledger (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    book_id     BIGINT NOT NULL COMMENT '图书 id',
+    biz_type    VARCHAR(16) NOT NULL COMMENT '销售结账 / 销售退款 / 进货入库 / 进货作废',
+    biz_id      BIGINT NOT NULL COMMENT '业务单据 id（销售单 / 进货单 id）',
+    change_qty  INT NOT NULL COMMENT '库存增量（正：入库/退款回滚；负：结账扣减/作废回滚）',
+    stock_after INT NOT NULL COMMENT '变更后库存余量',
+    remark      VARCHAR(255) COMMENT '备注',
+    created_at  DATETIME NOT NULL COMMENT '流水时间（北京时间）',
+    CONSTRAINT uk_stock_ledger_biz UNIQUE (biz_type, biz_id, book_id),
+    INDEX idx_book_time (book_id, created_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------- 外键 ----------------
@@ -101,6 +128,7 @@ ALTER TABLE purchase_item ADD CONSTRAINT fk_pi_purchase FOREIGN KEY (purchase_id
 ALTER TABLE purchase_item ADD CONSTRAINT fk_pi_book FOREIGN KEY (book_id) REFERENCES book (id);
 ALTER TABLE sale_item ADD CONSTRAINT fk_si_sale FOREIGN KEY (sale_id) REFERENCES sale (id);
 ALTER TABLE sale_item ADD CONSTRAINT fk_si_book FOREIGN KEY (book_id) REFERENCES book (id);
+ALTER TABLE stock_ledger ADD CONSTRAINT fk_sl_book FOREIGN KEY (book_id) REFERENCES book (id);
 ALTER TABLE supplier_status_log ADD CONSTRAINT fk_ssl_supplier FOREIGN KEY (supplier_id) REFERENCES supplier (id);
 
 -- =====================================================================
@@ -145,14 +173,16 @@ INSERT INTO purchase_item (purchase_id, book_id, qty, cost) VALUES
 (3, 8,  20, 15.00),  -- 小王子（草稿）
 (4, 4,   5, 48.00);  -- 水浒传（已作废）
 
--- 销售单：s1、s2 已结账；s3 已退款（异常态）
-INSERT INTO sale (total, status, created_at) VALUES
-(117.90, '已结账', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 12 DAY),
-( 59.00, '已结账', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 8 DAY),
-( 48.00, '已退款', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 25 DAY);
+-- 销售单：s1、s2 已结账；s3 已退款（异常态，带退款时间）
+INSERT INTO sale (total, status, refunded_at, created_at) VALUES
+(117.90, '已结账', NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 12 DAY),
+( 59.00, '已结账', NULL, UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 8 DAY),
+( 48.00, '已退款', UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 25 DAY + INTERVAL 2 HOUR,
+         UTC_TIMESTAMP() + INTERVAL 8 HOUR - INTERVAL 25 DAY);
 
-INSERT INTO sale_item (sale_id, book_id, qty) VALUES
-(1, 6, 1),  -- 三体
-(1, 8, 1),  -- 小王子
-(2, 1, 1),  -- 红楼梦
-(3, 4, 1);  -- 水浒传（已退款，库存已回滚）
+-- 明细带结账快照（书名 / ISBN / 单价），模拟真实结账后固化的凭证
+INSERT INTO sale_item (sale_id, book_id, qty, book_title, book_isbn, book_price) VALUES
+(1, 6, 1, '三体',   '9787020000066', 88.00),  -- 三体
+(1, 8, 1, '小王子', '9787020000080', 29.90),  -- 小王子
+(2, 1, 1, '红楼梦', '9787020000011', 59.00),  -- 红楼梦
+(3, 4, 1, '水浒传', '9787020000042', 48.00);  -- 水浒传（已退款，库存已回滚）

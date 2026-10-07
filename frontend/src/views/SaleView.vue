@@ -1,6 +1,6 @@
 <script setup>
-import { ref, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ref, computed, onMounted } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import router from '../router'
 import api from '../api'
 
@@ -15,6 +15,9 @@ const books = ref([])
 const dialogVisible = ref(false)
 const saving = ref(false)
 const form = ref({ items: [] })
+
+// 结账 / 退款进行中标记：请求未返回前禁用两个动作按钮，连点不会发出第二个请求
+const busy = ref(false)
 
 const STATUS_TAG = { '草稿': 'info', '已结账': 'success', '已退款': 'warning' }
 
@@ -51,6 +54,15 @@ async function load() {
   }
 }
 
+/**
+ * 动作结束后无论成败都强制重新拉取列表 + 详情：
+ * 成功 → 立刻反映新状态；失败（含并发冲突、已被另一操作员退款）→
+ * 用后端最新状态覆盖页面，杜绝「页面显示已退款但库存未恢复 / 按钮还能点」的过期视图。
+ */
+async function resync() {
+  await Promise.all([load(), emit('changed')])
+}
+
 async function selectSale(id) {
   selectedId.value = id
   await loadDetail(id)
@@ -70,11 +82,43 @@ function fmtPrice(p) {
   return p != null ? `¥${Number(p).toFixed(2)}` : '—'
 }
 
-function fmtSubtotal(row) {
-  return row.book && row.book.price != null
-    ? `¥${(Number(row.book.price) * (row.qty || 0)).toFixed(2)}`
-    : '—'
+// 已结账 / 已退款的单子以结账快照价为准（历史凭证），草稿才用实时价
+function rowPrice(row) {
+  if (row.bookPrice != null) return row.bookPrice
+  return row.book ? row.book.price : null
 }
+
+function rowTitle(row) {
+  if (row.book) return row.book.title
+  return row.bookTitle || '未知图书'
+}
+
+function rowIsbn(row) {
+  if (row.book) return row.book.isbn
+  return row.bookIsbn
+}
+
+function fmtSubtotal(row) {
+  const price = rowPrice(row)
+  return price != null ? `¥${(Number(price) * (row.qty || 0)).toFixed(2)}` : '—'
+}
+
+function fmtTime(t) {
+  return t ? String(t).replace('T', ' ').slice(0, 19) : '—'
+}
+
+// 动作合法性由后端权威判定，页面只做同源状态镜像：
+// 仅「草稿」可结账、仅「已结账」可退款；进行中禁用；明细引用的图书档案缺失时两个动作都禁用（后端也会整单拒绝）
+const canCheckout = computed(() =>
+  detail.value
+  && !busy.value
+  && detail.value.sale.status === '草稿'
+  && !detail.value.hasMissingBook)
+const canRefund = computed(() =>
+  detail.value
+  && !busy.value
+  && detail.value.sale.status === '已结账'
+  && !detail.value.hasMissingBook)
 
 async function openNew() {
   books.value = await api.listBooks('在售')
@@ -107,24 +151,40 @@ async function submitNew() {
 }
 
 async function checkout() {
+  if (!canCheckout.value) return
+  busy.value = true
   try {
     await api.checkoutSale(selectedId.value)
     ElMessage.success('已结账，库存已扣减')
-    await load()
-    emit('changed')
   } catch (e) {
     ElMessage.error(e.message)
+  } finally {
+    busy.value = false
+    await resync()
   }
 }
 
 async function refund() {
+  if (!canRefund.value) return
+  try {
+    await ElMessageBox.confirm(
+      '退款将一次性恢复本单全部图书的库存，且不可撤销。确认退款？',
+      '退款确认',
+      { type: 'warning', confirmButtonText: '确认退款', cancelButtonText: '取消' }
+    )
+  } catch (e) {
+    return // 用户取消
+  }
+  busy.value = true
   try {
     await api.refundSale(selectedId.value)
-    ElMessage.success('已退款，库存已回滚')
-    await load()
-    emit('changed')
+    ElMessage.success('已退款，全部图书库存已一次性恢复')
   } catch (e) {
+    // 含并发 409 / 已被他人退款 / 档案缺失整单拒绝：按提示刷新后重试
     ElMessage.error(e.message)
+  } finally {
+    busy.value = false
+    await resync()
   }
 }
 
@@ -153,6 +213,7 @@ onMounted(load)
             <el-tag :type="STATUS_TAG[s.status]" size="small">{{ s.status }}</el-tag>
           </div>
           <div class="row-sub">总额 ¥{{ (s.total || 0).toFixed(2) }}</div>
+          <div v-if="s.status === '已退款'" class="row-sub">退款时间 {{ fmtTime(s.refundedAt) }}</div>
         </div>
         <el-empty v-if="!sales.length" description="暂无销售单" :image-size="60" />
       </div>
@@ -164,7 +225,29 @@ onMounted(load)
             <span>销售单 #{{ detail.sale.id }}</span>
             <el-tag :type="STATUS_TAG[detail.sale.status]" size="small">{{ detail.sale.status }}</el-tag>
             <span class="muted">总额 ¥{{ (detail.sale.total || 0).toFixed(2) }}</span>
+            <span v-if="detail.sale.status === '已退款'" class="muted">
+              退款时间 {{ fmtTime(detail.sale.refundedAt) }}
+            </span>
           </div>
+
+          <!-- 明细存在档案缺失的图书：保留结账快照并明确提示。草稿不能结账、已结账单不能退款 -->
+          <el-alert
+            v-if="detail.hasMissingBook && detail.sale.status === '草稿'"
+            type="error"
+            :closable="false"
+            show-icon
+            style="margin-top:10px"
+            title="本单有明细引用的图书档案已缺失，无法结账（库存无法核对扣减）。请删除该明细或联系管理员补建图书档案后刷新重试"
+          />
+          <el-alert
+            v-else-if="detail.hasMissingBook"
+            type="error"
+            :closable="false"
+            show-icon
+            style="margin-top:10px"
+            title="本单有明细引用的图书档案已缺失，下表保留结账时的书名/书号/单价快照；库存无法核对回滚，该单不能退款，请联系管理员补建档案后刷新重试"
+          />
+
           <el-table :data="detail.items" border size="small" style="margin-top:10px">
             <el-table-column label="图书" min-width="200">
               <template #default="{ row }">
@@ -172,12 +255,19 @@ onMounted(load)
                   <div>{{ row.book.title }}</div>
                   <div class="book-sub">ISBN {{ row.book.isbn || '未登记' }}</div>
                 </template>
-                <span v-else class="book-sub">图书档案缺失（#{{ row.bookId }}）</span>
+                <template v-else>
+                  <!-- 档案缺失：用结账快照保留原信息，不丢凭证 -->
+                  <div>
+                    {{ rowTitle(row) }}
+                    <el-tag type="danger" size="small" effect="plain">档案缺失</el-tag>
+                  </div>
+                  <div class="book-sub">ISBN {{ rowIsbn(row) || '未登记' }}（结账快照）</div>
+                </template>
               </template>
             </el-table-column>
             <el-table-column prop="qty" label="数量" width="80" />
             <el-table-column label="单价" width="100">
-              <template #default="{ row }">{{ row.book ? fmtPrice(row.book.price) : '—' }}</template>
+              <template #default="{ row }">{{ fmtPrice(rowPrice(row)) }}</template>
             </el-table-column>
             <el-table-column label="小计" width="110">
               <template #default="{ row }">{{ fmtSubtotal(row) }}</template>
@@ -191,14 +281,19 @@ onMounted(load)
           <div class="actions">
             <el-button
               type="success"
-              :disabled="detail.sale.status !== '草稿'"
+              :loading="busy"
+              :disabled="!canCheckout"
               @click="checkout"
             >结账</el-button>
             <el-button
               type="warning"
-              :disabled="detail.sale.status !== '已结账'"
+              :loading="busy"
+              :disabled="!canRefund"
               @click="refund"
             >退款</el-button>
+            <span v-if="detail.sale.status === '已退款'" class="muted">
+              已退款，库存已恢复（{{ fmtTime(detail.sale.refundedAt) }}），不可重复退款
+            </span>
           </div>
         </template>
         <el-empty v-else description="请选择左侧销售单" />
@@ -241,7 +336,7 @@ onMounted(load)
 .detail-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-weight: 600; }
 .muted { color: var(--muted); font-weight: 400; font-size: 13px; }
 .book-sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
-.actions { margin-top: 14px; display: flex; gap: 10px; }
+.actions { margin-top: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .items { display: flex; flex-direction: column; gap: 8px; }
 .item-row { display: flex; gap: 8px; align-items: center; }
 </style>

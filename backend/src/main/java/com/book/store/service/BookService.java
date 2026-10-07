@@ -13,6 +13,7 @@ import com.book.store.common.BizException;
 import com.book.store.common.Dict;
 import com.book.store.common.PageResult;
 import com.book.store.entity.Book;
+import com.book.store.entity.StockLedger;
 import com.book.store.repository.BookRepository;
 import com.book.store.repository.BookSpecifications;
 
@@ -23,9 +24,11 @@ public class BookService {
     private static final int MAX_PAGE_SIZE = 200;
 
     private final BookRepository bookRepository;
+    private final StockLedgerService stockLedgerService;
 
-    public BookService(BookRepository bookRepository) {
+    public BookService(BookRepository bookRepository, StockLedgerService stockLedgerService) {
         this.bookRepository = bookRepository;
+        this.stockLedgerService = stockLedgerService;
     }
 
     /**
@@ -54,6 +57,17 @@ public class BookService {
      */
     public Book get(Long id) {
         return bookRepository.findById(id).orElseThrow(() -> new BizException("图书不存在"));
+    }
+
+    /**
+     * 某本书的库存流水（只读）：销售结账扣减、退款回滚、进货入库、入库单作废逐笔可查，
+     * 每笔带变更后余量，财务库存与销售 / 进货记录可据此逐笔核对。
+     */
+    public List<StockLedger> stockLedgers(Long bookId) {
+        if (bookRepository.findById(bookId).isEmpty()) {
+            throw new BizException("图书不存在");
+        }
+        return stockLedgerService.listByBook(bookId);
     }
 
     @Transactional

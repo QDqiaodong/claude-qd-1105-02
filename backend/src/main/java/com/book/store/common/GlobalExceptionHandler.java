@@ -45,16 +45,20 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * 唯一约束冲突：400（避免在页面上抛出非人话的外键报错）
+     * 唯一约束冲突：400。除 ISBN / 供应商名重复外，还包括库存流水唯一键
+     * (biz_type,biz_id,book_id) 冲突——那是并发重复结账/退款被数据库拦下的最后一道防线，
+     * 事务回滚、库存未重复变动，提示刷新确认即可，避免在页面抛出底层外键报错。
      */
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ApiResponse<Void>> handleIntegrity(DataIntegrityViolationException e) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(ApiResponse.fail("存在唯一性约束冲突，请检查编号、手机号是否重复"));
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.fail("数据冲突：编号 / 手机号重复，或该单据已被其他操作处理过（库存不会重复变动），请刷新页面确认最新状态"));
     }
 
     /**
-     * 并发冲突：供应商停用/启用与采购建档、入库等操作抢同一行锁超时。
-     * 业务本身已经整单回滚、未留半更新，这里提示用户刷新后安全重试。
+     * 并发冲突：停用/启用与采购建档入库、销售结账/退款与其他单据操作抢同一批行锁超时。
+     * 业务本身已经整单回滚、未留半更新（库存、单据状态、流水都未变更），这里返回 409
+     * 提示用户刷新取得最新状态后安全重试；重复退款的第二个请求会在锁内读到「已退款」并被拒绝。
      */
     @ExceptionHandler(CannotAcquireLockException.class)
     public ResponseEntity<ApiResponse<Void>> handleLock(CannotAcquireLockException e) {
@@ -71,7 +75,7 @@ public class GlobalExceptionHandler {
 
     private static ResponseEntity<ApiResponse<Void>> conflict() {
         return ResponseEntity.status(HttpStatus.CONFLICT)
-                .body(ApiResponse.fail("操作与供应商状态变更/其他入库操作并发冲突，单据未做任何变更，请刷新后重试"));
+                .body(ApiResponse.fail("操作与其他单据处理并发冲突（可能有其他操作员正在结账/退款），本单未做任何变更，请刷新页面获取最新状态后重试"));
     }
 
     /**

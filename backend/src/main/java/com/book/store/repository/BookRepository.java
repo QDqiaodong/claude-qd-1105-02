@@ -1,5 +1,6 @@
 package com.book.store.repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -30,4 +31,15 @@ public interface BookRepository extends JpaRepository<Book, Long>, JpaSpecificat
     @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "5000"))
     @Query("SELECT b FROM Book b WHERE b.id = :id")
     Optional<Book> findByIdForUpdate(@Param("id") Long id);
+
+    /**
+     * 一次对一批图书加 X 锁，并按 id 升序返回。销售结账 / 退款、进货入库 / 作废
+     * 全部统一「按 book id 升序」加锁，消除跨事务反向持锁导致的死锁；
+     * 同一张销售单的并发退款还会先锁销售单头，二者共同保证库存校验与状态变更
+     * 在同一批行锁内完成，读不到对方事务的中间态。
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "5000"))
+    @Query("SELECT b FROM Book b WHERE b.id IN :ids ORDER BY b.id ASC")
+    List<Book> findAllByIdForUpdate(@Param("ids") Collection<Long> ids);
 }

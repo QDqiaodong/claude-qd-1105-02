@@ -3,9 +3,11 @@ package com.book.store.service;
 import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -28,15 +30,18 @@ public class PurchaseService {
     private final PurchaseItemRepository purchaseItemRepository;
     private final BookRepository bookRepository;
     private final SupplierRepository supplierRepository;
+    private final StockLedgerService stockLedgerService;
 
     public PurchaseService(PurchaseRepository purchaseRepository,
                            PurchaseItemRepository purchaseItemRepository,
                            BookRepository bookRepository,
-                           SupplierRepository supplierRepository) {
+                           SupplierRepository supplierRepository,
+                           StockLedgerService stockLedgerService) {
         this.purchaseRepository = purchaseRepository;
         this.purchaseItemRepository = purchaseItemRepository;
         this.bookRepository = bookRepository;
         this.supplierRepository = supplierRepository;
+        this.stockLedgerService = stockLedgerService;
     }
 
     // ---------------- DTO ----------------
@@ -248,15 +253,22 @@ public class PurchaseService {
         if (items.isEmpty()) {
             throw new BizException("进货单无明细，无法入库");
         }
+        // 与销售结账 / 退款统一按 book id 升序加锁，跨业务并发不死锁
+        Map<Long, Book> locked = lockBooks(items);
         for (PurchaseItem it : items) {
-            Book book = bookRepository.findByIdForUpdate(it.bookId)
-                    .orElseThrow(() -> new BizException("明细图书已不存在"));
-            book.stock += it.qty;
+            Book book = locked.get(it.bookId);
+            if (book == null) {
+                throw new BizException("明细图书（#" + it.bookId + "）档案已缺失，无法入库");
+            }
+            int before = book.stock;
+            book.stock = before + it.qty;
             // 入库后若有库存且原缺货，恢复在售
             if (book.stock > 0 && "缺货".equals(book.status)) {
                 book.status = "在售";
             }
             bookRepository.save(book);
+            stockLedgerService.record(book, StockLedgerService.BIZ_PURCHASE_IN, id,
+                    it.qty, "进货单 #" + id + " 入库（入库前库存 " + before + "）");
         }
         purchase.status = "已入库";
         Purchase saved = purchaseRepository.save(purchase);
@@ -276,21 +288,58 @@ public class PurchaseService {
         }
         // 已入库的作废需回滚库存
         if ("已入库".equals(purchase.status)) {
-            for (PurchaseItem it : purchaseItemRepository.findByPurchaseId(id)) {
-                Book book = bookRepository.findByIdForUpdate(it.bookId).orElse(null);
-                if (book != null) {
-                    book.stock = Math.max(0, book.stock - it.qty);
-                    if (book.stock == 0 && "在售".equals(book.status)) {
-                        book.status = "缺货";
-                    }
-                    bookRepository.save(book);
+            List<PurchaseItem> items = purchaseItemRepository.findByPurchaseId(id);
+            Map<Long, Book> locked = lockBooks(items);
+            // 先整单校验（缺失档案 / 余量被后续销售占用），任何一本不通过都在改库存之前抛出，
+            // 不允许只回滚部分明细
+            for (PurchaseItem it : items) {
+                Book book = locked.get(it.bookId);
+                if (book == null) {
+                    throw new BizException("明细图书（#" + it.bookId
+                            + "）档案已缺失，库存无法核对回滚，本单未做任何变更，请补建档案后重试");
                 }
+                if (book.stock < it.qty) {
+                    throw new BizException("图书《" + book.title + "》当前库存 " + book.stock
+                            + "，不足回滚本入库单的 " + it.qty
+                            + "，本单未做任何变更，请核对销售占用后重试");
+                }
+            }
+            // 校验全部通过后一次性回滚
+            for (PurchaseItem it : items) {
+                Book book = locked.get(it.bookId);
+                int before = book.stock;
+                book.stock = before - it.qty;
+                if (book.stock == 0 && "在售".equals(book.status)) {
+                    book.status = "缺货";
+                }
+                bookRepository.save(book);
+                stockLedgerService.record(book, StockLedgerService.BIZ_PURCHASE_VOID, id,
+                        -it.qty, "进货单 #" + id + " 作废回滚（回滚前库存 " + before + "）");
             }
         }
         purchase.status = "已作废";
         Purchase saved = purchaseRepository.save(purchase);
         fillSupplierSnapshot(List.of(saved));
         return saved;
+    }
+
+    /**
+     * 按明细涉及的图书加 X 锁（book id 升序），与销售结账 / 退款共用同一加锁顺序，
+     * 保证任意两个跨业务事务不会反向持锁，消除死锁。物理缺失的图书不在结果中，由调用方校验。
+     */
+    private Map<Long, Book> lockBooks(List<PurchaseItem> items) {
+        List<Long> ids = items.stream()
+                .map(it -> it.bookId)
+                .distinct()
+                .sorted()
+                .collect(Collectors.toList());
+        Map<Long, Book> locked = new LinkedHashMap<>();
+        if (!ids.isEmpty()) {
+            for (Book b : bookRepository.findAllByIdForUpdate(ids)) {
+                locked.put(b.id, b);
+            }
+        }
+        return locked;
     }
 
     private static String reasonText(String reason) {

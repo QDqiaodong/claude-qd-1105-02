@@ -51,6 +51,15 @@ public class BookController {
         return ApiResponse.success(bookService.get(id));
     }
 
+    /**
+     * 图书库存流水：每一笔引起库存变化的结账 / 退款 / 入库 / 作废都在此可追溯，
+     * 带变更后余量，供财务核对「单据 ↔ 库存」是否一致。
+     */
+    @GetMapping("/{id}/stock-ledgers")
+    public ApiResponse<java.util.List<com.book.store.entity.StockLedger>> stockLedgers(@PathVariable Long id) {
+        return ApiResponse.success(bookService.stockLedgers(id));
+    }
+
     @PostMapping
     public ApiResponse<Book> create(@RequestBody Book book) {
         return ApiResponse.success(bookService.create(book));

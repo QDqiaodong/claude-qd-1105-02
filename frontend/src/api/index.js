@@ -39,6 +39,8 @@ export default {
   }))),
   // 图书详情：按主键定位，与列表排序 / 分页无关
   getBook: (id) => call(http.get(`/books/${id}`)),
+  // 图书库存流水：结账扣减 / 退款回滚 / 入库 / 作废逐笔可追溯
+  bookStockLedgers: (id) => call(http.get(`/books/${id}/stock-ledgers`)),
   createBook: (d) => call(http.post('/books', d)),
   updateBook: (id, d) => call(http.put(`/books/${id}`, d)),
 
